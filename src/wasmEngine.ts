@@ -50,11 +50,11 @@ const WasmInst = new AsyncOnce(async () => {
 
   if (hasWasmSIMDSupport) {
     const wasmModule = await (wasmSIMD_bg as any)();
-    (wasmSIMD as any).setWasm(wasmModule);
+    await (wasmSIMD as any).setWasm(wasmModule);
     return wasmSIMD;
   } else {
     const wasmModule = await (wasmNoSIMD_bg as any)();
-    (wasmNoSIMD as any).setWasm(wasmModule);
+    await (wasmNoSIMD as any).setWasm(wasmModule);
     return wasmNoSIMD;
   }
 });

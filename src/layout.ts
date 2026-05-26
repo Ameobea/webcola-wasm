@@ -147,6 +147,9 @@ const wasmInstPromise = getDerivativeComputerWasm();
          * iterate the layout.  Returns true when layout converged.
          */
         protected tick(): boolean {
+            if (!this._descent) {
+                return false;
+            }
             if (this._alpha < this._threshold) {
                 this._running = false;
                 this.trigger({ type: EventType.end, alpha: this._alpha = 0, stress: this._lastStress });
