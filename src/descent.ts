@@ -58,6 +58,20 @@ DEBUG */
     export class Descent {
         private wasm: DerivativeComputerWasmInst;
         private ctxPtr: number;
+        /**
+         * `true` when the specialized 2D engine (fast_* exports) is in use.  Positions then
+         * live in wasm memory and `x` is a pair of views into it; the whole integrator runs
+         * wasm-side per `rungeKutta` call.
+         */
+        private fast: boolean = false;
+        private allD: Float32Array | null = null;
+        private xViews: Float32Array[] | null = null;
+        private lastLockCount = 0;
+
+        /** integrator used by the fast engine: 0 = RK4 (original), 1 = midpoint, 2 = gradient descent */
+        public integratorMode = 0;
+        /** number of integrator steps per rungeKutta() call (fast engine only) */
+        public substeps = 1;
 
         public threshold: number = 0.0001;
         /** gradient vector
@@ -67,7 +81,9 @@ DEBUG */
             const memory: WebAssembly.Memory = this.wasm.get_memory();
             const memoryView = new Float32Array(memory.buffer);
 
-            const gPtr = this.k === 2 ? this.wasm.get_g_2d(this.ctxPtr) : this.wasm.get_g_3d(this.ctxPtr);
+            const gPtr = this.fast
+                ? (this.wasm as any).fast_g_ptr(this.ctxPtr)
+                : this.k === 2 ? this.wasm.get_g_2d(this.ctxPtr) : this.wasm.get_g_3d(this.ctxPtr);
             const gOffset = gPtr / BYTES_PER_F32;
             return new Array(this.k)
                 .fill(null)
@@ -84,7 +100,9 @@ DEBUG */
                 }
             })();
 
-            if (this.k === 2) {
+            if (this.fast) {
+                (this.wasm as any).fast_set_g(this.ctxPtr, allG);
+            } else if (this.k === 2) {
                 this.wasm.set_G_2d(this.ctxPtr, allG);
             } else if (this.k === 3) {
                 this.wasm.set_G_3d(this.ctxPtr, allG);
@@ -95,7 +113,25 @@ DEBUG */
        /** positions vector
          * @property x {number[][]}
          */
-        public x: Float32Array[];
+        private _x: Float32Array[];
+        public get x(): Float32Array[] {
+            if (!this.fast) {
+                return this._x;
+            }
+            // views into wasm memory; rebuilt if the memory grew (which detaches old buffers)
+            if (!this.xViews || this.xViews[0].length === 0) {
+                const memView = new Float32Array((this.wasm.get_memory() as WebAssembly.Memory).buffer);
+                const off = (this.wasm as any).fast_x_ptr(this.ctxPtr) / BYTES_PER_F32;
+                this.xViews = [
+                    memView.subarray(off, off + this.n),
+                    memView.subarray(off + this.n, off + 2 * this.n),
+                ];
+            }
+            return this.xViews;
+        }
+        public set x(v: Float32Array[]) {
+            this._x = v;
+        }
         /**
          * @property k {number} dimensionality
          */
@@ -109,6 +145,12 @@ DEBUG */
          * matrix of desired distances between pairs of nodes
          */
          public get D(): Float32Array[] {
+            if (this.fast) {
+                return new Array(this.n)
+                    .fill(null)
+                    .map((_, i) => this.allD!.subarray(i * this.n, i * this.n + this.n));
+            }
+
             const memory: WebAssembly.Memory = this.wasm.get_memory();
             const memoryView = new Float32Array(memory.buffer);
 
@@ -120,6 +162,22 @@ DEBUG */
         }
 
         public computeDerivatives(x: Float32Array[]) {
+            if (this.fast) {
+                const packed = new Float32Array(this.n * 2);
+                packed.set(x[0], 0);
+                packed.set(x[1], this.n);
+                const outX: Float32Array = (this.wasm as any).fast_compute(this.ctxPtr, packed);
+                x[0].set(outX.subarray(0, this.n));
+                x[1].set(outX.subarray(this.n, 2 * this.n));
+
+                if (!this.locks.isEmpty()) {
+                    this.locks.apply((u, p) => {
+                        (this.wasm as any).fast_apply_lock(this.ctxPtr, u, p[0], p[1], x[0][u], x[1][u]);
+                    });
+                }
+                return;
+            }
+
             if (this.k === 2) {
                 const packedX = (() => {
                     const packed = new Float32Array(x[0].length * this.k);
@@ -212,6 +270,15 @@ DEBUG */
                 }
             });
 
+            if (this.fast) {
+                this.allD = allD;
+                this.ctxPtr = (this.wasm as any).fast_create(this.n, allD);
+                if (G) {
+                    (this.wasm as any).fast_set_g(this.ctxPtr, allG);
+                }
+                return;
+            }
+
             const createrFn = this.k === 2 ? this.wasm.create_derivative_computer_ctx_2d : this.wasm.create_derivative_computer_ctx_3d;
             this.ctxPtr = createrFn(this.n, allD, allG);
         }
@@ -226,12 +293,21 @@ DEBUG */
          */
         constructor(x: number[][], D: number[][], G: number[][] = null, wasm: DerivativeComputerWasmInst) {
             this.wasm = wasm;
-            this.x = x.map(xn => new Float32Array(xn));
             this.k = x.length; // dimensionality
             var n = this.n = x[0].length; // number of nodes
+            this.fast = this.k === 2 && typeof (wasm as any).fast_create === 'function';
 
             // Set up Wasm context
             this.setupWasm(D, G);
+
+            if (this.fast) {
+                const packed = new Float32Array(2 * n);
+                packed.set(x[0], 0);
+                packed.set(x[1], n);
+                (this.wasm as any).fast_set_x(this.ctxPtr, packed);
+            } else {
+                this.x = x.map(xn => new Float32Array(xn));
+            }
 
             this.a = new Array(this.k);
             this.b = new Array(this.k);
@@ -242,6 +318,10 @@ DEBUG */
             this.ib = new Array(this.k);
             this.xtmp = new Array(this.k);
             this.locks = new Locks();
+            if (this.fast) {
+                this.minD = 1;
+                return;
+            }
             this.minD = Number.MAX_VALUE;
             var i = n, j;
             while (i--) {
@@ -306,6 +386,9 @@ DEBUG */
         // derivative information in this.g and this.H
         // returns the scalar multiplier to apply to d to get the optimal step
         public computeStepSize(): number {
+            if (this.fast) {
+                return (this.wasm as any).fast_step_size(this.ctxPtr);
+            }
             if (this.k === 2) {
                 return this.wasm.compute_step_size_2d(this.ctxPtr);
             } else if (this.k === 3) {
@@ -389,7 +472,24 @@ DEBUG */
             }
         }
 
+        private syncLocks() {
+            const entries: number[] = [];
+            this.locks.apply((id, p) => {
+                entries.push(id, p[0], p[1]);
+            });
+            if (entries.length === 0 && this.lastLockCount === 0) {
+                return;
+            }
+            this.lastLockCount = entries.length;
+            (this.wasm as any).fast_set_locks(this.ctxPtr, new Float32Array(entries));
+        }
+
         public run(iterations: number): number {
+            if (this.fast) {
+                this.syncLocks();
+                return (this.wasm as any).fast_run(this.ctxPtr, iterations, this.threshold, this.integratorMode);
+            }
+
             var stress = Number.MAX_VALUE, converged = false;
             while (!converged && iterations-- > 0) {
                 var s = this.rungeKutta();
@@ -400,6 +500,15 @@ DEBUG */
         }
 
         public rungeKutta(): number {
+            if (this.fast) {
+                this.syncLocks();
+                let disp = 0;
+                for (let i = 0; i < this.substeps; i++) {
+                    disp = (this.wasm as any).fast_tick(this.ctxPtr, this.integratorMode);
+                }
+                return disp;
+            }
+
             this.computeNextPosition(this.x, this.a);
             Descent.mid(this.x, this.a, this.ia);
             this.computeNextPosition(this.ia, this.b);

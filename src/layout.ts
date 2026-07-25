@@ -454,6 +454,23 @@ const wasmInstPromise = getDerivativeComputerWasm();
             return typeof this._linkType === "function" ? this._linkType(link) : 0;
         }
 
+        private _integratorMode: number = 0;
+
+        /**
+         * Integrator used by the fast 2D engine: 0 = RK4 (default, original webcola behavior),
+         * 1 = midpoint (~2x faster per tick), 2 = plain gradient descent (~4x faster per tick).
+         * Cheaper integrators converge over proportionally more ticks.  No effect on the
+         * fallback (non-fast) engine, which always uses RK4.
+         */
+        integrator(): number
+        integrator(mode: number): this
+        integrator(mode?: number): any {
+            if (typeof mode === 'undefined') return this._integratorMode;
+            this._integratorMode = mode;
+            if (this._descent) this._descent.integratorMode = mode;
+            return this;
+        }
+
         linkAccessor: LinkLengthTypeAccessor = {
             getSourceIndex: Layout.getSourceIndex,
             getTargetIndex: Layout.getTargetIndex,
@@ -608,6 +625,7 @@ const wasmInstPromise = getDerivativeComputerWasm();
             this.avoidOverlaps(false);
             const wasmInst = await wasmInstPromise;
             this._descent = new Descent([x, y], D, undefined, wasmInst);
+            this._descent.integratorMode = this._integratorMode;
 
             this._descent.locks.clear();
             for (var i = 0; i < n; ++i) {

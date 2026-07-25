@@ -1,4 +1,3 @@
-#![feature(core_intrinsics, wasm_simd)]
 #![allow(non_snake_case)]
 
 use rand::prelude::*;
@@ -6,6 +5,9 @@ use rand_pcg::Pcg32;
 #[cfg(feature = "simd")]
 use std::arch::wasm32::*;
 use wasm_bindgen::prelude::*;
+
+#[cfg(feature = "simd")]
+mod fast2d;
 
 pub struct Context<const DIMS: usize> {
     /// Number of nodes
